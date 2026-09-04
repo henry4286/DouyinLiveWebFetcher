@@ -1,9 +1,27 @@
 
 # 抖音网页版弹幕数据抓取
 
-> 本仓库当前在 `douyin` 直播话术副驾项目中仅作为**短期技术验证用的数据采集候选适配器**。其目标职责是把网页直播间事件采集并转换为结构化事件，不承载话术生成、知识库、主播画像或前端业务；当前代码尚未完成该结构化改造。待抖音开放平台恢复直播互动插件准入后，采集入口应替换为官方实现，核心业务不随数据源迁移。
+> 本仓库当前在 `douyin` 直播话术副驾项目中仅作为**短期技术验证用的数据采集候选适配器**。其目标职责是把网页直播间事件采集并转换为结构化事件，不承载话术生成、知识库、主播画像或前端业务。待抖音开放平台恢复直播互动插件准入后，采集入口应替换为官方实现，核心业务不随数据源迁移。
 
-详细的集成边界、实测记录、事件契约、可靠性改造清单和迁移原则见 [docs/INTEGRATION_ARCHITECTURE.md](docs/INTEGRATION_ARCHITECTURE.md)。当前代码仍是研究样例，解析结果只通过 `print` 输出，**不得直接视为可上线的采集服务**。
+详细的集成边界、实测记录、事件契约、可靠性改造清单和迁移原则见 [docs/INTEGRATION_ARCHITECTURE.md](docs/INTEGRATION_ARCHITECTURE.md)。当前已支持 `CollectorEvent v1` 回调和 NDJSON 输出；主项目的本地监管器已实现进程级重连、有界分帧背压、关播停止和健康统计。持久重放、连接看门狗、长跑/断网验收和生产治理仍未完成，**不得直接视为可上线的采集服务**。
+
+结构化采集模式：
+
+```powershell
+.\.venv\Scripts\python.exe -u main.py 957390047296 --output ndjson
+```
+
+该模式下 stdout 每行只包含一个完整 JSON 事件，诊断信息写入 stderr。省略 `--output ndjson` 时保留原有的人类可读日志。代码集成也可向 `DouyinLiveWebFetcher(..., event_sink=callback)` 传入回调函数。
+
+由父进程监管时可显式启用 stdin 控制通道：
+
+```powershell
+.\.venv\Scripts\python.exe -u main.py 957390047296 --output ndjson --control-stdin
+```
+
+启用后，父进程应独占子进程 stdin，并发送单独一行、内容精确为 `stop` 的停止指令；关闭 stdin（EOF）也会触发同一个幂等 `stop()`。未知或超长输入只在 stderr 输出不含原文的安全错误类别，绝不会写入 NDJSON stdout。该参数默认关闭，因此直接运行和现有 human 模式不会启动 stdin 读取线程。
+
+CLI 会主动把 NDJSON stdout 配置为 UTF-8，不依赖 Windows 当前代码页；callback 和 NDJSON sink 都会串行投递并发事件。当前未验证 `WebcastSocialMessage.action` 的含义，在线人数统计也不是核心事件，因此二者只产生不含用户内容的诊断，不进入 `CollectorEvent v1` 数据流。缺少平台消息 ID 且平台时间也不可信时，fallback ID 只能标识本次本地观测，不能保证对稍后重收的同一平台事件去重。错误诊断尚未实现限速，仍属于下一阶段工作。
 
 ## 使用和许可前置条件
 
@@ -22,7 +40,7 @@
 
 ### 环境：
 - windows 10
-- python 3.7+
+- Python 3.10+
 - `protoc`版本：`libprotoc 25.1`
 - NodeJs v18.2.0
 

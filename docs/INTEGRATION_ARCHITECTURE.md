@@ -43,7 +43,7 @@ LiveEventIngressCoordinator → LiveCopilotService
 2. 计算签名并建立 WebSocket；
 3. 启动心跳线程，处理 ACK；
 4. 用本地 Protobuf 模型解包消息；
-5. 将聊天、礼物、点赞、进场、关注、粉丝团、统计、直播结束等消息直接打印到标准输出。
+5. 在 `--output ndjson` 模式把已支持的消息转换为 `CollectorEvent v1`，stdout 每行只输出一个事件，诊断写入 stderr；默认 `human` 模式仍保留原有中文控制台输出。
 
 ### 2.2 2026-09-04 本地观察
 
@@ -62,21 +62,21 @@ LiveEventIngressCoordinator → LiveCopilotService
 - 排行榜处理会打印巨大对象，长期运行会污染日志并放大 I/O；
 - 当前观察无法证明“平台全量、零丢失、严格有序”。只能确认收到了普通自然评论的数据形态。
 
-## 3. 为什么当前代码还不能直接接入核心
+## 3. 第一阶段进度与仍未解除的上线阻断
 
-| 问题 | 当前表现 | 影响 |
+| 问题 | 当前状态 | 影响/下一步 |
 |---|---|---|
-| 输出契约 | 所有解析器只 `print` 中文文本 | 下游只能脆弱地解析日志，字段会丢失且无法演进 |
-| 异常处理 | `_wsOnMessage` 对解析异常静默 `pass` | 协议漂移和数据损坏不可见，可能长期悄悄丢事件 |
+| 输出契约 | 已实现 `CollectorEvent v1` callback 和 NDJSON sink；human 模式保留 | 主项目已用独立监管器消费 NDJSON，严禁重新解析中文日志 |
+| 异常处理 | 信封、ACK 和消息解析错误已分类并写入生命周期/诊断输出 | 还需错误计数、限速和告警，避免高频错误淹没 stderr |
 | 重连 | `_wsOnClose` 只查询状态并打印，不重连 | 瞬时网络故障后采集永久停止 |
-| 生命周期 | 心跳线程没有 daemon/stop event，每次 open 都可能新建线程 | 停止不确定，重连后可能产生重复心跳线程 |
+| 生命周期 | 已加入 stop event、daemon 心跳、线程回收和幂等 `stop()` | 尚无自动重连；加入重连后仍需验证每代连接只有一个心跳线程 |
 | 背压 | WebSocket 回调中同步解析和打印，无有界队列 | 高流量或下游变慢会阻塞接收与 ACK |
-| 幂等 | 未输出平台消息 ID，也无去重 | 重连、补帧或平台重发会导致重复话术 |
+| 幂等 | 已优先输出平台消息 ID，缺失时生成确定性 fallback ID | 若平台 ID 和可信平台时间同时缺失，fallback 只能标识单次本地观测，不能保证跨重收去重；礼物连击仍需专项状态机 |
 | 可观测性 | 无结构化日志、指标、健康状态和错误分类 | 无法判断“直播安静”还是“采集已坏” |
-| 隐私 | 昵称、评论和用户字段直接输出 | 日志可能成为未治理的个人信息副本 |
+| 隐私 | 排行榜大对象已停止打印，固定 `111111` 用户 ID 已降级为空 | human 模式仍会打印昵称和评论；只允许用于受控调试，生产日志策略未完成 |
 | 协议维护 | UA、游标、版本、设备 ID 等参数硬编码 | 网页协议变化时容易整体失效 |
 
-禁止把控制台中文输出当作正式接口。改造应从解析器直接构造事件开始，而不是增加正则表达式解析 `print`。
+第一阶段代码已经可以与主项目适配器做契约测试，但仍不是生产接入。禁止把控制台中文输出当作正式接口；正式传输只接受严格校验的 NDJSON 事件。
 
 ## 4. CollectorEvent v1 契约
 
@@ -106,7 +106,8 @@ LiveEventIngressCoordinator → LiveCopilotService
   },
   "quality": {
     "eventId": "platform",
-    "actorId": "unavailable"
+    "actorId": "unavailable",
+    "occurredAt": "platform"
   }
 }
 ```
@@ -115,7 +116,7 @@ LiveEventIngressCoordinator → LiveCopilotService
 
 - `schemaVersion`：必填，版本不认识时下游必须拒收并报警。
 - `kind`：`data` 或 `lifecycle`。只有 `data` 会映射为核心直播事件。
-- `eventId`：优先使用消息 `Common.msg_id` 的十进制字符串。不要加入采集器名称，使同一抖音事件未来经官方和网页来源到达时仍有机会使用同一去重键。缺失时使用双方约定的确定性哈希，并在 `quality.eventId=fallback` 标记，不能用随机 UUID。
+- `eventId`：优先使用消息 `Common.msg_id` 的十进制字符串。不要加入采集器名称，使同一抖音事件未来经官方和网页来源到达时仍有机会使用同一去重键。缺失时使用双方约定的确定性哈希，并在 `quality.eventId=fallback` 标记，不能用随机 UUID。若平台 ID 和可信平台时间同时缺失，哈希中的 `occurredAt` 只能采用本次 `receivedAt`：它对同一次观测是确定的，但稍后重收会得到另一个 ID，不能宣称跨重收去重。
 - `roomId`：平台真实房间 ID；`webRid` 是用户输入的网页直播 ID，两者不能混用。
 - `occurredAt`：优先平台 `Common.create_time`，统一为 Unix 毫秒；`receivedAt` 是本机接收时间，用于衡量延迟。
 - `actor.sourceUserId`：只有验证为稳定、真实且允许处理时才输出。当前 `111111` 必须映射为 `null`，不能伪装成抖音开放平台 `open_id` 或 `sec_open_id`。
@@ -130,9 +131,9 @@ LiveEventIngressCoordinator → LiveCopilotService
 | `WebcastLikeMessage` | `like` | `like` | 使用本次增量；不能假定零丢失 |
 | `WebcastGiftMessage` | `gift` | `gift` | 包含礼物 ID、名称、数量；连击需专项去重 |
 | `WebcastMemberMessage` | `enter_room` | `enter_room` | 高流量时可降级采样或丢弃 |
-| `WebcastSocialMessage` | `social` | 经验证后映射 `follow` | action 语义未验证前禁止都当作关注 |
+| `WebcastSocialMessage` | 默认不输出业务事件 | 无 | action 语义未验证；结构化模式只记录不含用户信息的安全诊断，禁止伪称关注 |
 | `WebcastFansclubMessage` | `fansclub` | `fansclub` | 当前空 content 不能作为唯一依据 |
-| `WebcastRoomUserSeqMessage` / `WebcastRoomStatsMessage` | `room_stats` | 暂不进入核心 | 作为观测值，不承诺精确结算 |
+| `WebcastRoomUserSeqMessage` / `WebcastRoomStatsMessage` | 默认不输出业务事件 | 无 | 结构化模式只记录安全统计诊断，不承诺精确结算 |
 | `WebcastControlMessage` | `room_control` | 生命周期 | status=3 表示直播结束 |
 | 排行榜、流适配、未知消息 | 默认不输出业务事件 | 无 | 只计数，按需采样诊断 |
 
@@ -157,6 +158,8 @@ LiveEventIngressCoordinator → LiveCopilotService
 
 `start()` 应阻塞到运行循环结束；`stop()` 必须幂等，设置 stop event、关闭 WebSocket、结束心跳、停止重连并清空或限时排空队列。直播结束是正常终态；网络失败和协议失败不是同一状态。
 
+CLI 的父进程控制协议为 opt-in：只有传入 `--control-stdin` 才启动 daemon 控制线程，并且必须在阻塞的 `start()` 之前启动。stdin 每次只做有限长度读取，仅接受单独一行、内容精确为 `stop` 的指令；管道 EOF 与 `stop` 都调用同一个幂等停止路径。未知、空白或超长输入不回显原文，只向 stderr 写安全错误类别，不能污染 stdout NDJSON。采集循环退出时只对控制线程做有超时的短暂 join，不能因 stdin 仍阻塞而拖住进程退出。未启用该参数时保持原 CLI 行为。
+
 ### 5.2 重连策略
 
 - 非主动关闭且直播未确认结束时自动重连；
@@ -176,7 +179,7 @@ WebSocket 回调只做 ACK、解包、最小字段提取和入队。传输使用
 4. 排行榜默认不进入业务通道；
 5. 队列满时必须计数和报警，不能静默丢弃，也不能因为日志或下游阻塞 WebSocket ACK。
 
-第一阶段推荐本机子进程 stdout NDJSON：部署简单、凭据不跨主机。主项目负责拉起进程、传入经过校验的 `webRid`、读取 stdout、监控退出码和限速重启。若改用 HTTP，必须增加本机绑定或 mTLS、认证、请求大小限制、超时和重放防护。
+第一阶段推荐本机子进程 stdout NDJSON：部署简单、凭据不跨主机。主项目负责拉起进程、传入经过校验的 `webRid`、读取 stdout、监控退出码和限速重启，并通过启用 `--control-stdin` 后发送 `stop\n` 实现优雅停止；若父进程直接关闭控制管道，EOF 同样要求采集器停止。若改用 HTTP，必须增加本机绑定或 mTLS、认证、请求大小限制、超时和重放防护。
 
 ## 6. 去重、顺序和一致性
 
@@ -228,12 +231,12 @@ WebSocket 回调只做 ACK、解包、最小字段提取和入队。传输使用
 - [ ] 许可、作者声明、平台规则和个人信息处理已有书面结论；
 - [ ] 已建立主播书面授权和指定直播间白名单硬门；无有效授权时采集器拒绝启动，系统不存在批量枚举或采集无关房间的入口；
 - [ ] 授权撤回/到期流程通过演练：立即停止对应采集和重连，并能按策略定位、删除相关原始数据、诊断样本及派生数据；
-- [ ] 解析器输出 `CollectorEvent v1`，stdout 无混杂日志；
-- [ ] 主项目实现 `WebFetcherLiveEventSource`，且核心不导入本仓库代码；
-- [ ] 房间与主播绑定失败时 fail closed；
-- [ ] 用户 ID `111111` 和粉丝团空字段问题已查明或明确降级；
-- [ ] 消息解析异常不再静默，未知/失败率可报警；
-- [ ] 自动重连、幂等停止、单一心跳线程通过故障测试；
+- [x] 解析器输出 `CollectorEvent v1`，NDJSON 模式 stdout 无混杂日志；
+- [x] 主项目实现独立 `WebFetcherLiveEventSource` 契约适配器，且核心不导入本仓库代码；生产进程监管与路由尚未接入；
+- [x] 房间与主播必须通过显式授权绑定，绑定缺失、冲突或不匹配时 fail closed；
+- [x] 固定用户 ID `111111` 已降级为空；粉丝团不完整字段按可空处理，不据此猜测身份；
+- [ ] 消息解析异常不再静默；未知 method 已可见，但失败率指标和报警尚未实现；
+- [ ] 幂等停止和单一 daemon 心跳已通过单元测试；自动重连及其故障测试尚未实现；
 - [ ] 有界队列、优先级降级和背压指标通过高流量测试；
 - [ ] 评论、礼物连击、关注语义、直播结束和重连重复经过样本回归；
 - [ ] 运行 8 小时以上的稳定性测试记录 CPU、RSS、线程和事件速率；
@@ -242,9 +245,9 @@ WebSocket 回调只做 ACK、解包、最小字段提取和入队。传输使用
 
 建议分阶段改造：
 
-1. **P0 正确性**：事件 emitter、标准字段、异常可见、屏蔽大对象、解决或降级不可信用户 ID。
-2. **P0 可靠性**：停止信号、心跳生命周期、自动重连、有界队列、去重基础字段。
-3. **P1 集成**：NDJSON transport、主项目适配器、启动/健康协议、隔离队列。
+1. **P0 正确性（第一阶段已完成）**：事件 emitter、标准字段、异常可见、屏蔽大对象、降级不可信用户 ID。
+2. **P0 可靠性（部分完成）**：已完成停止信号、心跳生命周期和去重基础字段；待完成自动重连、有界队列和背压。
+3. **P1 集成（本地装配已完成）**：已完成 NDJSON transport、stdin 优雅停止、主项目契约适配器、进程监管、健康状态和默认关闭的单房间本地路由；生产路由明确禁用，持久入箱/重放仍待实现。
 4. **P1 治理**：结构化指标、隐私脱敏、留存和凭据扫描、长稳与故障测试。
 5. **P2 运维**：小流量金丝雀、协议漂移告警、版本回滚和签名/Protobuf 更新手册。
 
