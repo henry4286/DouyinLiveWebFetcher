@@ -49,10 +49,36 @@ def actor_fields(user: Any) -> tuple[dict, str]:
     # First-stage protobuf user IDs are not trusted. A future release may add a
     # validated resolver policy; a caller-controlled boolean is intentionally
     # not exposed because permission and semantic stability cannot be inferred.
-    return {
+    actor = {
         "sourceUserId": None,
         "nickname": nickname,
-    }, "unavailable"
+    }
+    observed = getattr(user, "id", None)
+    if type(observed) is int and 0 < observed <= 18446744073709551615 and observed != 111111:
+        actor["observedSourceUserId"] = str(observed)
+    sec_uid = getattr(user, "sec_uid", None)
+    if isinstance(sec_uid, str) and 0 < len(sec_uid) <= 256 and all(c.isascii() and (c.isalnum() or c in "-_") for c in sec_uid):
+        actor["observedSecUid"] = sec_uid
+    # Only explicit nonzero observations: protobuf defaults do not establish
+    # that a viewer is level zero or does not follow the anchor.
+    profile = {}
+    follow = getattr(user, 'follow_info', None)
+    grade = getattr(user, 'pay_grade', None)
+    club = getattr(getattr(user, 'fans_club', None), 'data', None)
+    for key, value in (
+        ('followStatusRaw', getattr(follow, 'follow_status', None)),
+        ('payGradeLevel', getattr(grade, 'level', None)),
+        ('fansClubLevel', getattr(club, 'level', None)),
+        ('fansClubStatusRaw', getattr(club, 'user_fans_club_status', None)),
+    ):
+        if type(value) is int and 0 < value <= 100000:
+            profile[key] = value
+    club_anchor = getattr(club, 'anchor_id', None)
+    if type(club_anchor) is int and 0 < club_anchor <= 18446744073709551615 and club_anchor != 111111:
+        profile['fansClubAnchorId'] = str(club_anchor)
+    if profile:
+        actor['observedProfile'] = profile
+    return actor, "unavailable"
 
 
 def build_collector_event(
@@ -91,6 +117,12 @@ def build_collector_event(
                 "nickname": actor.get("nickname"),
             }
         )
+        if actor.get("observedSourceUserId") is not None:
+            normalized_actor["observedSourceUserId"] = actor["observedSourceUserId"]
+        if actor.get("observedSecUid") is not None:
+            normalized_actor["observedSecUid"] = actor["observedSecUid"]
+        if actor.get("observedProfile"):
+            normalized_actor["observedProfile"] = dict(actor["observedProfile"])
 
     normalized_room_id = str(room_id) if room_id not in (None, "") else None
     normalized_web_rid = str(web_rid)

@@ -591,6 +591,11 @@ class DouyinLiveWebFetcher:
                 # Value semantics have not been validated, so do not infer
                 # monetary value from diamond_count/fan_ticket_count.
                 'giftValue': None,
+                'comboCount': int(message.combo_count),
+                'repeatCount': int(message.repeat_count),
+                'repeatEnd': int(message.repeat_end),
+                'groupId': str(message.group_id) if message.group_id else None,
+                'countSemantics': 'unverified',
             },
             method=method, outer_msg_id=outer_msg_id,
             received_at=received_at, user=message.user,
@@ -603,8 +608,11 @@ class DouyinLiveWebFetcher:
         message = LikeMessage().parse(payload)
         user_name = message.user.nick_name
         count = message.count
+        observed_payload = {'likeCount': int(count)}
+        if 0 < message.total <= 9007199254740991:
+            observed_payload['totalLikeCount'] = int(message.total)
         return self._emit_data(
-            'like', message, {'likeCount': int(count)}, method=method,
+            'like', message, observed_payload, method=method,
             outer_msg_id=outer_msg_id, received_at=received_at,
             user=message.user,
             human_message=f"【点赞msg】{user_name} 点了{count}个赞",
@@ -637,7 +645,10 @@ class DouyinLiveWebFetcher:
         else:
             # Safe diagnostic: do not expose the actor or claim that an
             # unverified numeric action means follow/unfollow.
-            self._diagnostic(f"social message ignored action={message.action}")
+            return self._emit_data(
+                'social', message, {'action': int(message.action), 'semantics': 'unverified'},
+                method=method, outer_msg_id=outer_msg_id, received_at=received_at, user=message.user,
+            )
         return None
 
     def _parseRoomUserSeqMsg(self, payload, *,
@@ -656,9 +667,11 @@ class DouyinLiveWebFetcher:
                 f"【统计msg】当前观看人数: {current}, 累计观看人数: {total}"
             )
         else:
-            self._diagnostic(
-                f"room stats ignored onlineCount={current} "
-                f"totalViewerCount={total_viewers}"
+            return self._emit_data(
+                'room_stats', message,
+                {'onlineCount': int(current) if current >= 0 else None,
+                 'totalViewerCount': total_viewers if total_viewers is not None and total_viewers >= 0 else None},
+                method=method, outer_msg_id=outer_msg_id, received_at=received_at,
             )
         return None
 
@@ -707,8 +720,18 @@ class DouyinLiveWebFetcher:
         if self.event_sink is None:
             self._human_log(f"【直播间统计msg】{display_long}")
         else:
-            total = int(message.total) if message.total >= 0 else None
-            self._diagnostic(f"room stats ignored totalViewerCount={total}")
+            total = int(message.total) if 0 <= message.total <= 9007199254740991 else None
+            return self._emit_data(
+                'room_stats', message, {
+                    'onlineCount': None, 'totalViewerCount': None,
+                    'observedTotal': total,
+                    'displayText': message.display_long[:256] or None,
+                    'displayValue': int(message.display_value) if 0 <= message.display_value <= 9007199254740991 else None,
+                    'displayTypeRaw': int(message.display_type) if 0 <= message.display_type <= 9007199254740991 else None,
+                    'countSemantics': 'unverified',
+                },
+                method=method, outer_msg_id=outer_msg_id, received_at=received_at,
+            )
         return None
 
     def _parseRankMsg(self, payload, **_context):

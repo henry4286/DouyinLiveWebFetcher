@@ -187,7 +187,7 @@ class FetcherParserTests(unittest.TestCase):
         message = ChatMessage(
             common=Common(msg_id=10, room_id=123,
                           create_time=PLATFORM_MS),
-            user=User(id=987654321, nick_name='viewer'),
+            user=User(id=987654321, sec_uid='MS4wLjAB-synthetic_only', nick_name='viewer'),
             content='这套搭配为什么这样选',
         )
         event = self.fetcher._parseChatMsg(
@@ -200,6 +200,8 @@ class FetcherParserTests(unittest.TestCase):
         self.assertEqual(event['actor'], {
             'sourceUserId': None,
             'nickname': 'viewer',
+            'observedSourceUserId': '987654321',
+            'observedSecUid': 'MS4wLjAB-synthetic_only',
         })
         self.assertEqual(event['quality']['actorId'], 'unavailable')
 
@@ -215,8 +217,19 @@ class FetcherParserTests(unittest.TestCase):
             encoded(message), received_at=NOW_MS
         )
 
-        self.assertEqual(event['payload'], {'likeCount': 7})
+        self.assertEqual(event['payload'], {'likeCount': 7, 'totalLikeCount': 99})
         self.assertNotIn('total', event['payload'])
+
+    def test_observed_ids_reject_placeholders_and_preserve_uint64_as_text(self):
+        for user_id in (0, 111111, 18446744073709551615):
+            event = self.fetcher._parseChatMsg(encoded(ChatMessage(
+                common=Common(msg_id=123, room_id=123), user=User(id=user_id), content='fixture')))
+            self.assertIsNone(event['actor']['sourceUserId'])
+            self.assertEqual(event['quality']['actorId'], 'unavailable')
+            if user_id in (0, 111111):
+                self.assertNotIn('observedSourceUserId', event['actor'])
+            else:
+                self.assertEqual(event['actor']['observedSourceUserId'], str(user_id))
 
     def test_gift_emits_minimal_fields_without_guessing_value(self):
         message = GiftMessage(
@@ -236,6 +249,8 @@ class FetcherParserTests(unittest.TestCase):
             'giftName': '星星',
             'giftCount': 3,
             'giftValue': None,
+            'comboCount': 3, 'repeatCount': 0, 'repeatEnd': 0,
+            'groupId': None, 'countSemantics': 'unverified',
         })
 
     def test_room_end_emits_lifecycle_then_stops_once(self):
@@ -412,7 +427,7 @@ class FetcherParserTests(unittest.TestCase):
         self.assertFalse(heartbeat.is_alive())
         self.assertIn('observer failed', diagnostics.getvalue())
 
-    def test_unverified_social_and_stats_do_not_emit_v1_data(self):
+    def test_social_and_stats_emit_observations_not_follow_or_user_identity(self):
         social = SocialMessage(
             common=Common(msg_id=17),
             user=User(nick_name='must-not-leak'),
@@ -431,10 +446,16 @@ class FetcherParserTests(unittest.TestCase):
             self.fetcher._parseRoomUserSeqMsg(encoded(user_sequence))
             self.fetcher._parseRoomStatsMsg(encoded(room_stats))
 
-        self.assertEqual(self.sink.events, [])
+        self.assertEqual([e['type'] for e in self.sink.events], ['social', 'room_stats', 'room_stats'])
+        self.assertEqual(self.sink.events[0]['payload'], {'action': 1, 'semantics': 'unverified'})
+        self.assertEqual(self.sink.events[1]['payload'], {'onlineCount': 12, 'totalViewerCount': 34})
+        self.assertEqual(self.sink.events[2]['payload'], {
+            'onlineCount': None, 'totalViewerCount': None, 'observedTotal': 56,
+            'displayText': 'private display', 'displayValue': 0, 'displayTypeRaw': 0,
+            'countSemantics': 'unverified'})
         self.assertNotIn('must-not-leak', diagnostics.getvalue())
         self.assertNotIn('private display', diagnostics.getvalue())
-        self.assertIn('action=1', diagnostics.getvalue())
+        self.assertNotIn('follow', [e['type'] for e in self.sink.events])
 
 
 class NdjsonIsolationTests(unittest.TestCase):
