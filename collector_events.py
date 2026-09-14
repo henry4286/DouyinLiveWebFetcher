@@ -12,9 +12,32 @@ import sys
 import threading
 import time
 from typing import Any, Callable, Mapping, Optional, TextIO
+from urllib.parse import urlsplit
 
 
 SCHEMA_VERSION = "douyin-web-collector-event-v1"
+MAX_SAFE_COUNT = 9007199254740991
+
+
+def _observed_avatar_url(user: Any) -> Optional[str]:
+    """Keep one supplied image URL; never fetch it or reconstruct an account URL."""
+    for image_name in ('avatar_thumb', 'avatar_medium', 'avatar_large'):
+        image = getattr(user, image_name, None)
+        urls = getattr(image, 'url_list_list', ())
+        if not isinstance(urls, (list, tuple)):
+            continue
+        for url in urls:
+            if (not isinstance(url, str) or not 0 < len(url) <= 4096
+                    or any(char.isspace() or not char.isprintable() for char in url)):
+                continue
+            try:
+                parsed = urlsplit(url)
+                if (parsed.scheme in ('https', 'http') and parsed.hostname
+                        and parsed.username is None and parsed.password is None):
+                    return url
+            except ValueError:
+                continue
+    return None
 
 
 def _canonical_json(value: Mapping[str, Any]) -> str:
@@ -65,6 +88,20 @@ def actor_fields(user: Any) -> tuple[dict, str]:
     follow = getattr(user, 'follow_info', None)
     grade = getattr(user, 'pay_grade', None)
     club = getattr(getattr(user, 'fans_club', None), 'data', None)
+    display_id = getattr(user, 'display_id', None)
+    if (isinstance(display_id, str) and 0 < len(display_id) <= 256
+            and all(char.isprintable() and not char.isspace() for char in display_id)):
+        profile['displayId'] = display_id
+    avatar_url = _observed_avatar_url(user)
+    if avatar_url is not None:
+        profile['avatarUrl'] = avatar_url
+    for key, attr in (('followerCount', 'follower_count'),
+                      ('followingCount', 'following_count')):
+        value = getattr(follow, attr, None)
+        # Proto3 scalar zero cannot distinguish missing from an observed zero.
+        # Keep integers safe for JSON consumers (including JavaScript).
+        if type(value) is int and 0 < value <= MAX_SAFE_COUNT:
+            profile[key] = value
     for key, value in (
         ('followStatusRaw', getattr(follow, 'follow_status', None)),
         ('payGradeLevel', getattr(grade, 'level', None)),
